@@ -1,7 +1,7 @@
 """
 MCP-Mesh Tool Registry and Dynamic RPC Router.
-Aggregates JSON-RPC 2.0 tool schemas, enforces circuit breakers and rate limits,
-and routes agent execution calls with p50/p95 latency telemetry.
+Aggregates JSON-RPC 2.0 tool schemas, enforces circuit breakers, rate limits,
+and execution timeouts, and dispatches single or batch calls with telemetry.
 """
 
 from typing import Any, Callable, Dict, List, Optional
@@ -17,9 +17,17 @@ from mcp_mesh.core.resilience import (
 
 
 class MCPToolRouter:
-    def __init__(self, resilience_manager: Optional[MeshResilienceManager] = None):
+    def __init__(
+        self,
+        resilience_manager: Optional[MeshResilienceManager] = None,
+        default_timeout_sec: float = 30.0,
+    ):
+        if default_timeout_sec <= 0.0:
+            raise ValueError("default_timeout_sec must be strictly positive.")
         self.tools: Dict[str, Dict[str, Any]] = {}
         self.execution_handlers: Dict[str, Callable] = {}
+        self.tool_timeouts: Dict[str, float] = {}
+        self.default_timeout_sec = float(default_timeout_sec)
         self.resilience = resilience_manager or MeshResilienceManager()
 
     def register_tool(
@@ -32,14 +40,22 @@ class MCPToolRouter:
         recovery_timeout_sec: Optional[float] = None,
         rate_capacity: Optional[float] = None,
         refill_rate_per_sec: Optional[float] = None,
+        timeout_sec: Optional[float] = None,
     ) -> None:
-        """Registers an MCP-compliant tool with schema, handler, and resilience policy."""
+        """Registers an MCP-compliant tool with schema, handler, timeout, and resilience policy."""
+        effective_timeout = (
+            self.default_timeout_sec if timeout_sec is None else float(timeout_sec)
+        )
+        if effective_timeout <= 0.0:
+            raise ValueError("timeout_sec must be strictly positive.")
+
         self.tools[name] = {
             "name": name,
             "description": description,
             "inputSchema": input_schema,
         }
         self.execution_handlers[name] = handler
+        self.tool_timeouts[name] = effective_timeout
         self.resilience.register_tool_policy(
             tool_name=name,
             failure_threshold=failure_threshold,
@@ -57,7 +73,7 @@ class MCPToolRouter:
         return self.resilience.get_mesh_diagnostics()
 
     async def execute_tool(self, name: str, arguments: dict) -> Dict[str, Any]:
-        """Dispatches JSON-RPC tool invocation with resilience guards and latency telemetry."""
+        """Dispatches JSON-RPC tool invocation with resilience guards, timeouts, and telemetry."""
         if name not in self.execution_handlers:
             return {
                 "isError": True,
@@ -86,19 +102,37 @@ class MCPToolRouter:
             }
 
         handler = self.execution_handlers[name]
+        timeout_sec = self.tool_timeouts.get(name, self.default_timeout_sec)
         t0 = time.perf_counter()
 
         try:
             if inspect.iscoroutinefunction(handler):
-                result = await handler(**arguments)
+                coro = handler(**arguments)
             else:
-                result = await asyncio.to_thread(handler, **arguments)
+                coro = asyncio.to_thread(handler, **arguments)
+
+            result = await asyncio.wait_for(coro, timeout=timeout_sec)
 
             elapsed_ms = (time.perf_counter() - t0) * 1000.0
             self.resilience.after_call(name, latency_ms=elapsed_ms, success=True)
             return {
                 "isError": False,
                 "content": [{"type": "text", "text": str(result)}],
+                "latency_ms": round(elapsed_ms, 2),
+            }
+        except asyncio.TimeoutError:
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+            self.resilience.after_call(name, latency_ms=elapsed_ms, success=False)
+            return {
+                "isError": True,
+                "error_type": "timeout",
+                "timeout_sec": timeout_sec,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Tool '{name}' timed out after {timeout_sec}s.",
+                    }
+                ],
                 "latency_ms": round(elapsed_ms, 2),
             }
         except Exception as e:
@@ -110,3 +144,15 @@ class MCPToolRouter:
                 "content": [{"type": "text", "text": f"Execution error: {str(e)}"}],
                 "latency_ms": round(elapsed_ms, 2),
             }
+
+    async def execute_batch(self, calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Executes multiple independent tool calls concurrently via asyncio.gather."""
+        tasks = [
+            self.execute_tool(name=call["name"], arguments=call.get("arguments") or {})
+            for call in calls
+        ]
+        raw_results = await asyncio.gather(*tasks)
+        return [
+            {"tool": call["name"], **result}
+            for call, result in zip(calls, raw_results)
+        ]
